@@ -1,3 +1,0 @@
-git add .
-git commit -m "Initial commit: homework app backend" 
-git push -u origin main 
