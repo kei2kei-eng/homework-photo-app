@@ -17,7 +17,8 @@ const PORT = process.env.PORT || 8080;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb' }));
 
 // Database connection
 const pool = new Pool({
@@ -25,14 +26,19 @@ const pool = new Pool({
 });
 
 // Multer setup for file uploads
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+});
 
 // Email transporter setup
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: process.env.SMTP_PORT === '465',
   auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_PASSWORD,
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASSWORD,
   },
 });
 
@@ -50,83 +56,127 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// Helper function to check individual answers using Claude Vision
-async function checkAnswersWithAI(base64Image) {
+// Helper function to check homework answers using LLaVA via Replicate
+async function checkAnswersWithAI(base64Image, question = '') {
   try {
-    const aiResponse = await axios.post(
-      'https://hnd1.aihub.zeabur.ai/v1/messages',
+    console.log('Starting LLaVA homework verification...');
+    
+    const prompt = `You are a homework verification assistant. Analyze this homework image and verify the answers.
+    
+${question ? `Question: ${question}` : 'Identify all visible answers or questions in the image.'}
+
+Return ONLY a valid JSON object with this exact structure (no markdown, no extra text):
+{
+  "isCorrect": true or false,
+  "score": 0-100,
+  "answers": [
+    {
+      "text": "answer text",
+      "isCorrect": true or false
+    }
+  ],
+  "feedback": "brief feedback about the homework"
+}
+
+Be strict but fair in grading. If unsure, mark as incorrect.`;
+
+    // Step 1: Create prediction
+    console.log('Creating Replicate prediction...');
+    const createResponse = await axios.post(
+      'https://api.replicate.com/v1/predictions',
       {
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 2048,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: 'image/jpeg',
-                  data: base64Image,
-                },
-              },
-              {
-                type: 'text',
-                text: `Please analyze this homework image and verify each answer. 
-                
-                Return a JSON object with this exact structure:
-                {
-                  "correct": true/false,
-                  "score": 0-100,
-                  "answers": [
-                    {
-                      "text": "Answer text or question",
-                      "correct": true/false
-                    }
-                  ],
-                  "feedback": "Overall feedback about the homework"
-                }
-                
-                For each visible answer or question, add an entry to the answers array.
-                Mark as correct (true) or incorrect (false).
-                Calculate overall score as percentage of correct answers.`,
-              },
-            ],
-          },
-        ],
+        version: 'ac732df83cea7fff18b51941e8e9fbda735b91cc7312c0359f5e93e7c14f01ef',
+        input: {
+          image: \`data:image/jpeg;base64,\${base64Image}\`,
+          prompt: prompt,
+        },
       },
       {
         headers: {
-          'x-api-key': process.env.AI_HUB_API_KEY,
+          Authorization: \`Token \${process.env.REPLICATE_API_KEY}\`,
           'Content-Type': 'application/json',
         },
       }
     );
 
-    const responseText = aiResponse.data.content[0].text;
+    const predictionId = createResponse.data.id;
+    console.log('Prediction created:', predictionId);
+
+    // Step 2: Poll for completion
+    let prediction = createResponse.data;
+    let attempts = 0;
+    const maxAttempts = 120; // 10 minutes with 5-second intervals
+
+    while (
+      (prediction.status === 'processing' || prediction.status === 'starting') &&
+      attempts < maxAttempts
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait 5 seconds
+      
+      const pollResponse = await axios.get(
+        \`https://api.replicate.com/v1/predictions/\${predictionId}\`,
+        {
+          headers: {
+            Authorization: \`Token \${process.env.REPLICATE_API_KEY}\`,
+          },
+        }
+      );
+      
+      prediction = pollResponse.data;
+      attempts++;
+      console.log(\`Poll attempt \${attempts}: status = \${prediction.status}\`);
+    }
+
+    if (prediction.status !== 'succeeded') {
+      throw new Error(\`Prediction failed with status: \${prediction.status}. Error: \${prediction.error}\`);
+    }
+
+    // Step 3: Parse the output
+    console.log('Parsing LLaVA response...');
+    const output = Array.isArray(prediction.output) 
+      ? prediction.output.join('') 
+      : prediction.output;
     
-    // Extract JSON from response
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    console.log('Raw output:', output);
+
+    // Extract JSON from response (handle markdown code blocks)
+    let jsonMatch = output.match(/\`\`\`json\n?([\s\S]*?)\n?\`\`\`/);
     if (!jsonMatch) {
-      throw new Error('Could not parse AI response');
+      jsonMatch = output.match(/\{[\s\S]*\}/);
     }
     
-    return JSON.parse(jsonMatch[0]);
+    if (!jsonMatch) {
+      throw new Error('Could not extract JSON from LLaVA response');
+    }
+
+    const jsonStr = jsonMatch[1] || jsonMatch[0];
+    const result = JSON.parse(jsonStr);
+
+    console.log('Parsed result:', result);
+
+    return {
+      isCorrect: result.isCorrect,
+      score: result.score || 0,
+      answers: result.answers || [],
+      feedback: result.feedback || 'No feedback available',
+    };
   } catch (error) {
-    console.error('AI verification error:', error);
-    throw error;
+    console.error('AI verification error:', error.message);
+    throw new Error(\`Failed to verify homework with AI: \${error.message}\`);
   }
 }
 
 // Helper function to remove answers from image (blur/pixelate answer areas)
 async function removeAnswersFromImage(imageBuffer) {
   try {
+    console.log('Processing image for practice mode...');
+    
     // Create a blurred version of the image to simulate answer removal
-    // This is a simple approach - in production, you might use more sophisticated techniques
     const processedImage = await sharp(imageBuffer)
-      .blur(2) // Slight blur to simulate answer removal
+      .blur(3)
       .toBuffer();
     
+    console.log('Image processed successfully');
     return processedImage;
   } catch (error) {
     console.error('Image processing error:', error);
@@ -138,40 +188,48 @@ async function removeAnswersFromImage(imageBuffer) {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Backend is running' });
+  res.json({ status: 'ok', message: 'Backend is running', timestamp: new Date() });
 });
 
 // Verify homework (main endpoint for the web app)
 app.post('/api/verify', upload.single('photo'), async (req, res) => {
   try {
+    console.log('Received verification request');
+    
     if (!req.file) {
       return res.status(400).json({ error: 'No photo uploaded' });
     }
 
     const mode = req.body.mode || 'check';
+    const question = req.body.question || '';
+    
+    console.log('Mode:', mode, 'Question:', question);
+
+    // Convert image to base64
     const base64Image = req.file.buffer.toString('base64');
 
-    // Get AI verification with individual answer checks
-    const aiResult = await checkAnswersWithAI(base64Image);
+    // Get AI verification with LLaVA
+    const aiResult = await checkAnswersWithAI(base64Image, question);
 
     const response = {
-      correct: aiResult.correct,
+      isCorrect: aiResult.isCorrect,
       score: aiResult.score,
-      answers: aiResult.answers || [],
+      answers: aiResult.answers,
       feedback: aiResult.feedback,
     };
 
     // If practice mode, remove answers from image
     if (mode === 'practice') {
+      console.log('Generating practice mode image...');
       const cleanedImageBuffer = await removeAnswersFromImage(req.file.buffer);
       const cleanedImageBase64 = cleanedImageBuffer.toString('base64');
-      response.cleaned_image = `data:image/jpeg;base64,${cleanedImageBase64}`;
+      response.cleanedImage = \`data:image/jpeg;base64,\${cleanedImageBase64}\`;
     }
 
     res.json(response);
   } catch (error) {
     console.error('Verification error:', error);
-    res.status(500).json({ error: 'Failed to verify homework' });
+    res.status(500).json({ error: error.message || 'Failed to verify homework' });
   }
 });
 
@@ -184,44 +242,46 @@ app.post('/api/send-email', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ error: 'Missing email or result' });
     }
 
-    const answersHtml = result.answers
+    const parsedResult = typeof result === 'string' ? JSON.parse(result) : result;
+
+    const answersHtml = (parsedResult.answers || [])
       .map(
         (answer) =>
-          `<li style="margin: 10px 0; padding: 10px; background: ${
-            answer.correct ? '#e8f5e9' : '#ffebee'
+          \`<li style="margin: 10px 0; padding: 10px; background: \${
+            answer.isCorrect ? '#e8f5e9' : '#ffebee'
           }; border-radius: 5px;">
-            <strong>${answer.correct ? '✓' : '✗'}</strong> ${answer.text}
-          </li>`
+            <strong>\${answer.isCorrect ? '✓' : '✗'}</strong> \${answer.text}
+          </li>\`
       )
       .join('');
 
     const mailOptions = {
-      from: process.env.GMAIL_USER,
+      from: process.env.SMTP_USER,
       to: email,
       subject: '📚 Homework Verification Result',
-      html: `
+      html: \`
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2 style="color: #333;">Homework Verification Result</h2>
           
-          <div style="background: ${
-            result.correct ? '#e8f5e9' : '#ffebee'
+          <div style="background: \${
+            parsedResult.isCorrect ? '#e8f5e9' : '#ffebee'
           }; padding: 20px; border-radius: 10px; margin: 20px 0;">
-            <h3 style="margin: 0; color: ${result.correct ? '#2e7d32' : '#c62828'};">
-              ${result.correct ? '✓ CORRECT!' : '✗ NEEDS WORK'}
+            <h3 style="margin: 0; color: \${parsedResult.isCorrect ? '#2e7d32' : '#c62828'};">
+              \${parsedResult.isCorrect ? '✓ CORRECT!' : '✗ NEEDS WORK'}
             </h3>
             <p style="margin: 10px 0; font-size: 24px; font-weight: bold;">
-              Score: ${result.score}%
+              Score: \${parsedResult.score}%
             </p>
           </div>
 
           <h3>Answer Check:</h3>
           <ul style="list-style: none; padding: 0;">
-            ${answersHtml}
+            \${answersHtml}
           </ul>
 
           <h3>Feedback:</h3>
           <p style="background: #f5f5f5; padding: 15px; border-radius: 5px; line-height: 1.6;">
-            ${result.feedback}
+            \${parsedResult.feedback}
           </p>
 
           <hr style="margin: 30px 0; border: none; border-top: 1px solid #ddd;">
@@ -229,14 +289,15 @@ app.post('/api/send-email', upload.single('photo'), async (req, res) => {
             Sent from Homework Photo App
           </p>
         </div>
-      `,
+      \`,
     };
 
     await transporter.sendMail(mailOptions);
+    console.log('Email sent to:', email);
     res.json({ message: 'Email sent successfully' });
   } catch (error) {
     console.error('Email error:', error);
-    res.status(500).json({ error: 'Failed to send email' });
+    res.status(500).json({ error: 'Failed to send email: ' + error.message });
   }
 });
 
@@ -246,12 +307,13 @@ app.post('/api/auth/register', async (req, res) => {
     const { email, password, role } = req.body;
 
     const result = await pool.query(
-      'INSERT INTO users (email, password, role) VALUES ($1, $2, $3) RETURNING id, email, role',
+      'INSERT INTO users (email, password, role) VALUES (\$1, \$2, \$3) RETURNING id, email, role',
       [email, password, role]
     );
 
     res.json({ user: result.rows[0] });
   } catch (error) {
+    console.error('Registration error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -262,7 +324,7 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     const result = await pool.query(
-      'SELECT * FROM users WHERE email = $1 AND password = $2',
+      'SELECT * FROM users WHERE email = \$1 AND password = \$2',
       [email, password]
     );
 
@@ -275,17 +337,21 @@ app.post('/api/auth/login', async (req, res) => {
 
     res.json({ token, user: { id: user.id, email: user.email, role: user.role } });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  console.error('Unhandled error:', err.stack);
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(\`Server running on port \${PORT}\`);
+  console.log('Environment:', process.env.NODE_ENV);
+  console.log('Database:', process.env.DATABASE_URL ? 'Connected' : 'Not configured');
+  console.log('Replicate API Key:', process.env.REPLICATE_API_KEY ? 'Configured' : 'Not configured');
 });
