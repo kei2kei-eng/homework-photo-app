@@ -20,7 +20,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const REPLICATE_API_KEY = process.env.REPLICATE_API_KEY;
-const LLAVA_MODEL_VERSION = 'ac732df83cea7fff18b51941e8e9fbda735b91cc7312c0359f5e93e7c14f01ef';
+// Updated to newer LLaVA model version
+const LLAVA_MODEL_VERSION = 'e5582ad2d6b1c9b4aab40177a8c06e48f3a7ba38163ea86db6995f1b165b8f60';
 
 // Email configuration
 const transporter = nodemailer.createTransport({
@@ -38,6 +39,8 @@ const transporter = nodemailer.createTransport({
  */
 async function callReplicateAPI(imageBase64, prompt) {
   try {
+    console.log('Calling Replicate API with prompt length:', prompt.length);
+    
     // Create prediction
     const createResponse = await axios.post(
       'https://api.replicate.com/v1/predictions',
@@ -57,6 +60,7 @@ async function callReplicateAPI(imageBase64, prompt) {
     );
 
     const predictionId = createResponse.data.id;
+    console.log('Prediction created:', predictionId);
     let prediction = createResponse.data;
     let attempts = 0;
     const maxAttempts = 120; // 10 minutes with 5-second intervals
@@ -79,16 +83,20 @@ async function callReplicateAPI(imageBase64, prompt) {
 
       prediction = pollResponse.data;
       attempts++;
+      console.log(`Poll attempt ${attempts}: status = ${prediction.status}`);
     }
 
     if (prediction.status !== 'succeeded') {
-      throw new Error(`Replicate API failed: ${prediction.status}`);
+      console.error('Prediction failed with status:', prediction.status);
+      console.error('Error details:', prediction.error);
+      throw new Error(`Replicate API failed: ${prediction.status} - ${prediction.error || 'Unknown error'}`);
     }
 
     const output = Array.isArray(prediction.output)
       ? prediction.output.join('')
       : prediction.output;
 
+    console.log('Replicate API output length:', output.length);
     return output;
   } catch (error) {
     console.error('Replicate API error:', error.message);
@@ -97,26 +105,32 @@ async function callReplicateAPI(imageBase64, prompt) {
 }
 
 /**
- * Extract JSON from text response
+ * Extract JSON from text response - More robust version
  */
 function extractJSON(text) {
   try {
+    console.log('Attempting to extract JSON from text of length:', text.length);
+    
     // Try to find JSON in code blocks first
     let jsonMatch = text.match(/```json\n?([\s\S]*?)\n?```/);
     if (jsonMatch) {
+      console.log('Found JSON in code block');
       return JSON.parse(jsonMatch[1]);
     }
 
     // Try to find raw JSON object
     jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
+      console.log('Found JSON object');
       return JSON.parse(jsonMatch[0]);
     }
 
     // Try to parse the entire text
+    console.log('Parsing entire text as JSON');
     return JSON.parse(text);
   } catch (error) {
     console.error('JSON extraction error:', error.message);
+    console.error('Text that failed to parse:', text.substring(0, 500));
     throw new Error('Could not extract valid JSON from response');
   }
 }
@@ -337,6 +351,8 @@ app.post('/api/extract-quiz', upload.single('photo'), async (req, res) => {
     }
 
     const imageBase64 = req.file.buffer.toString('base64');
+    console.log('Image size:', imageBase64.length, 'bytes');
+    
     const quiz = await extractQuizFromImage(imageBase64);
 
     res.json({
