@@ -20,8 +20,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const REPLICATE_API_KEY = process.env.REPLICATE_API_KEY;
-// Updated to newer LLaVA model version
-const LLAVA_MODEL_VERSION = 'e5582ad2d6b1c9b4aab40177a8c06e48f3a7ba38163ea86db6995f1b165b8f60';
+// Updated to current working LLaVA model version
+const LLAVA_MODEL_VERSION = 'llava-hf/llava-v1.6-mistral-7b';
 
 // Email configuration
 const transporter = nodemailer.createTransport({
